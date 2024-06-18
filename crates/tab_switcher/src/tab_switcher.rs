@@ -11,7 +11,7 @@ use gpui::{
 };
 use picker::{Picker, PickerDelegate};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use ui::{prelude::*, ListItem, ListItemSpacing, Tooltip};
 use util::ResultExt;
 use workspace::{
@@ -142,6 +142,10 @@ pub struct TabSwitcherDelegate {
     selected_index: usize,
     pane: WeakView<Pane>,
     matches: Vec<TabMatch>,
+    updating_matches: Option<(
+        Task<()>,
+        postage::dispatch::Receiver<Vec<StringMatch>>,
+    )>,
 }
 
 impl TabSwitcherDelegate {
@@ -158,6 +162,7 @@ impl TabSwitcherDelegate {
             selected_index: 0,
             pane,
             matches: Vec::new(),
+            updating_matches: None
         }
     }
 
@@ -184,42 +189,16 @@ impl TabSwitcherDelegate {
     }
 
     fn update_matches_by_query(&mut self, raw_query: String, cx: &mut ViewContext<Picker<TabSwitcherDelegate>>) -> Task<()> {
-      // let Some(pane) = self.pane.upgrade() else {
-      //   return Task::ready(());
-      // };
-      // let pane = pane.read(&cx);
-      // let Some(items) = self.fetch_item_candidates(cx) else {
-      //   return Task::ready(());
-      // };
-
-      // self.update_matches_a(cx);
-      // let tab_details = tab_details(&items, cx);
-      let Some(tab_matches) = self.tab_matches(cx) else {
+      let Some(candidates) = self.tab_matches(cx) else {
         return Task::ready(());
       };
 
 let (mut tx, mut rx) = postage::dispatch::channel(1);
         let executor = cx.background_executor().clone();
       let task = cx.background_executor().spawn({
-        let candidates = tab_matches
-            .iter()
-            .enumerate()
-            .filter_map(|(_ix, tab_match)| {
-              let Some(label) = tab_match.item.tab_description(tab_match.detail, cx) else {
-                return None;
-              };
-              return Some(StringMatchCandidate {
-                id: tab_match.item_index,
-                string: label.to_string(),
-                char_bag: label.chars().collect(),
-              })
-            })
-            .collect::<Vec<_>>();
-        println!("{:?}", candidates);
-
+        let query = raw_query.replace(' ', "");
+        let query = query.trim().to_string();
         async move {
-        let raw_query = raw_query.replace(' ', "");
-        let query = raw_query.trim();
 
             let matches = fuzzy::match_strings(
                 &candidates,
@@ -230,14 +209,11 @@ let (mut tx, mut rx) = postage::dispatch::channel(1);
                 executor,
             )
             .await;
-            println!("{:?}", matches);
-            // ret
-        tx.send(matches).await;
+        tx.send(matches).await.log_err();
       }});
 
-      Some((task, rx.clone()));
+      self.updating_matches = Some((task, rx.clone()));
 
-      // Need reference between item inde and queried values
       cx.spawn(move |picker, mut cx| async move {
           let Some(matches) = rx.recv().await else {
               return;
@@ -276,6 +252,33 @@ let (mut tx, mut rx) = postage::dispatch::channel(1);
       })
     }
 
+    fn finalize_update_matches(
+        &mut self,
+        query: String,
+        duration: Duration,
+        cx: &mut ViewContext<Picker<Self>>,
+    ) -> bool {
+        let Some((task, rx)) = self.updating_matches.take() else {
+            return true;
+        };
+
+        match cx
+            .background_executor()
+            .block_with_timeout(duration, rx.clone().recv())
+        {
+            Ok(Some(matches)) => {
+              println!("fuzzy matches bullshit");
+              println!("{:?}", matches);
+                // self.matches_updated(query, commands, matches, cx);
+                true
+            }
+            _ => {
+                self.updating_matches = Some((task, rx));
+                false
+            }
+        }
+    }
+
     fn fetch_item_candidates(&self, cx: &mut WindowContext) -> Option<Vec<Box<dyn ItemHandle>>> {
       let Some(pane) = self.pane.upgrade() else {
           return None;
@@ -302,7 +305,7 @@ let (mut tx, mut rx) = postage::dispatch::channel(1);
       Some(item.boxed_clone())
     }
 
-    fn tab_matches(&mut self, cx: &mut WindowContext) -> Option<Vec<TabMatch>> {
+    fn tab_matches(&mut self, cx: &mut WindowContext) -> Option<Vec<StringMatchCandidate>> {
       let Some(pane) = self.pane.upgrade() else {
           return None;
       };
@@ -320,11 +323,15 @@ let (mut tx, mut rx) = postage::dispatch::channel(1);
           .iter()
           .enumerate()
           .zip(tab_details(&items, cx))
-          .map(|((item_index, item), detail)| TabMatch {
-              item_index,
-              item: item.boxed_clone(),
-              detail,
-              preview: pane.is_active_preview_item(item.item_id()),
+          .filter_map(|((item_index, item), detail)| {
+            let Some(label) = item.tab_description(detail, cx) else {
+              return None;
+            };
+            Some(StringMatchCandidate {
+              id: item_index,
+              string: label.to_string(),
+              char_bag: label.chars().collect(),
+            })
           }).collect())
     }
 
