@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tab_switcher_tests;
 
-use postage::{sink::Sink, stream::Stream};
 use collections::HashMap;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
@@ -10,6 +9,7 @@ use gpui::{
     MouseUpEvent, ParentElement, Render, Styled, Task, View, ViewContext, VisualContext, WeakView,
 };
 use picker::{Picker, PickerDelegate};
+use postage::{sink::Sink, stream::Stream};
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 use ui::{prelude::*, ListItem, ListItemSpacing, Tooltip};
@@ -142,10 +142,7 @@ pub struct TabSwitcherDelegate {
     selected_index: usize,
     pane: WeakView<Pane>,
     matches: Vec<TabMatch>,
-    updating_matches: Option<(
-        Task<()>,
-        postage::dispatch::Receiver<Vec<StringMatch>>,
-    )>,
+    updating_matches: Option<(Task<()>, postage::dispatch::Receiver<Vec<StringMatch>>)>,
 }
 
 impl TabSwitcherDelegate {
@@ -162,7 +159,7 @@ impl TabSwitcherDelegate {
             selected_index: 0,
             pane,
             matches: Vec::new(),
-            updating_matches: None
+            updating_matches: None,
         }
     }
 
@@ -188,151 +185,116 @@ impl TabSwitcherDelegate {
         .detach();
     }
 
-    fn update_matches_by_query(&mut self, raw_query: String, cx: &mut ViewContext<Picker<TabSwitcherDelegate>>) -> Task<()> {
-      let Some(candidates) = self.tab_matches(cx) else {
-        return Task::ready(());
-      };
-
-let (mut tx, mut rx) = postage::dispatch::channel(1);
-        let executor = cx.background_executor().clone();
-      let task = cx.background_executor().spawn({
-        let query = raw_query.replace(' ', "");
-        let query = query.trim().to_string();
-        async move {
-
-            let matches = fuzzy::match_strings(
-                &candidates,
-                &query,
-                true,
-                10000,
-                &Default::default(),
-                executor,
-            )
-            .await;
-        tx.send(matches).await.log_err();
-      }});
-
-      self.updating_matches = Some((task, rx.clone()));
-
-      cx.spawn(move |picker, mut cx| async move {
-          let Some(matches) = rx.recv().await else {
-              return;
-          };
-          picker.update(&mut cx, |picker, _cx| {
-            let tab_matches: Vec<TabMatch> = picker.delegate.matches.iter().map(|x| TabMatch{
-              item_index: x.item_index,
-              item: x.item.boxed_clone(),
-              detail: x.detail,
-              preview: x.preview,
-              }).collect();
-            picker.delegate.matches.clear();
-          matches
-                    .iter()
-                    // .zip(picker.delegate.matches)
-                    .enumerate()
-                    .for_each(|(_index, string_match)| {
-                      let match_tab = tab_matches.get(string_match.candidate_id).unwrap();
-                        picker.delegate.matches.push(TabMatch {
-                          item_index: match_tab.item_index,
-                          detail: match_tab.detail,
-                          preview: match_tab.preview,
-                          item: match_tab.item.boxed_clone()
-
-                        })
-                    });
-          }).log_err();
-
-          // picker
-          //     .update(&mut cx, |picker, cx| {
-          //         picker
-          //             .delegate
-          //             .matches_updated(query, commands, matches, cx)
-          //     })
-          //     .log_err();
-      })
-    }
-
-    fn finalize_update_matches(
+    fn update_matches_by_query(
         &mut self,
-        query: String,
-        duration: Duration,
-        cx: &mut ViewContext<Picker<Self>>,
-    ) -> bool {
-        let Some((task, rx)) = self.updating_matches.take() else {
-            return true;
+        raw_query: String,
+        cx: &mut ViewContext<Picker<TabSwitcherDelegate>>,
+    ) -> Task<()> {
+        let Some(candidates) = self.tab_matches(cx) else {
+            return Task::ready(());
         };
 
-        match cx
-            .background_executor()
-            .block_with_timeout(duration, rx.clone().recv())
-        {
-            Ok(Some(matches)) => {
-              println!("fuzzy matches bullshit");
-              println!("{:?}", matches);
-                // self.matches_updated(query, commands, matches, cx);
-                true
+        let (mut tx, mut rx) = postage::dispatch::channel(1);
+        let executor = cx.background_executor().clone();
+        let task = cx.background_executor().spawn({
+            let query = raw_query.replace(' ', "");
+            let query = query.trim().to_string();
+            async move {
+                let matches = fuzzy::match_strings(
+                    &candidates,
+                    &query,
+                    true,
+                    10000,
+                    &Default::default(),
+                    executor,
+                )
+                .await;
+                tx.send(matches).await.log_err();
             }
-            _ => {
-                self.updating_matches = Some((task, rx));
-                false
-            }
-        }
-    }
+        });
 
-    fn fetch_item_candidates(&self, cx: &mut WindowContext) -> Option<Vec<Box<dyn ItemHandle>>> {
-      let Some(pane) = self.pane.upgrade() else {
-          return None;
-      };
-      let pane = pane.read(cx);
-      let mut history_indices = HashMap::default();
-      pane.activation_history().iter().rev().enumerate().for_each(
-          |(history_index, history_entry)| {
-              history_indices.insert(history_entry.entity_id, history_index);
-          },
-      );
+        self.updating_matches = Some((task, rx.clone()));
 
-      Some(pane.items().map(|item| item.boxed_clone()).collect())
-    }
+        cx.spawn(move |picker, mut cx| async move {
+            let Some(matches) = rx.recv().await else {
+                return;
+            };
+            picker
+                .update(&mut cx, |picker, _cx| {
+                    let tab_matches: Vec<TabMatch> = picker
+                        .delegate
+                        .matches
+                        .iter()
+                        .map(|x| TabMatch {
+                            item_index: x.item_index,
+                            item: x.item.boxed_clone(),
+                            detail: x.detail,
+                            preview: x.preview,
+                        })
+                        .collect();
+                    picker.delegate.matches.clear();
+                    matches
+                        .iter()
+                        // .zip(picker.delegate.matches)
+                        .enumerate()
+                        .for_each(|(_index, string_match)| {
+                            match tab_matches.get(string_match.candidate_id) {
+                                Some(match_tab) => {
+                                    picker.delegate.matches.push(TabMatch {
+                                        item_index: match_tab.item_index,
+                                        detail: match_tab.detail,
+                                        preview: match_tab.preview,
+                                        item: match_tab.item.boxed_clone(),
+                                    });
+                                }
+                                None => (),
+                            };
+                        });
+                })
+                .log_err();
 
-    fn fetch_item_for_index(&self, index: usize, cx: &mut WindowContext) -> Option<Box<dyn ItemHandle>> {
-      let Some(pane) = self.pane.upgrade() else {
-          return None;
-      };
-      let pane = pane.read(cx);
-      let Some(item) = pane.item_for_index(index) else {
-        return None;
-      };
-      Some(item.boxed_clone())
+            // picker
+            //     .update(&mut cx, |picker, cx| {
+            //         picker
+            //             .delegate
+            //             .matches_updated(query, commands, matches, cx)
+            //     })
+            //     .log_err();
+        })
     }
 
     fn tab_matches(&mut self, cx: &mut WindowContext) -> Option<Vec<StringMatchCandidate>> {
-      let Some(pane) = self.pane.upgrade() else {
-          return None;
-      };
-      let pane = pane.read(cx);
-      let mut history_indices = HashMap::default();
-      pane.activation_history().iter().rev().enumerate().for_each(
-          |(history_index, history_entry)| {
-              history_indices.insert(history_entry.entity_id, history_index);
-          },
-      );
+        let Some(pane) = self.pane.upgrade() else {
+            return None;
+        };
+        let pane = pane.read(cx);
+        let mut history_indices = HashMap::default();
+        pane.activation_history().iter().rev().enumerate().for_each(
+            |(history_index, history_entry)| {
+                history_indices.insert(history_entry.entity_id, history_index);
+            },
+        );
 
-      let items: Vec<Box<dyn ItemHandle>> = pane.items().map(|item| item.boxed_clone()).collect();
+        let items: Vec<Box<dyn ItemHandle>> = pane.items().map(|item| item.boxed_clone()).collect();
 
-      Some(items
-          .iter()
-          .enumerate()
-          .zip(tab_details(&items, cx))
-          .filter_map(|((item_index, item), detail)| {
-            let Some(label) = item.tab_description(detail, cx) else {
-              return None;
-            };
-            Some(StringMatchCandidate {
-              id: item_index,
-              string: label.to_string(),
-              char_bag: label.chars().collect(),
-            })
-          }).collect())
+        Some(
+            items
+                .iter()
+                .enumerate()
+                .zip(tab_details(&items, cx))
+                .filter_map(|((item_index, item), detail)| {
+                    let Some(label) = item.tab_tooltip_text(cx) else {
+                        return None;
+                    };
+                    println!("{:}", label);
+                    Some(StringMatchCandidate {
+                        id: item_index,
+                        string: label.to_string(),
+                        char_bag: label.chars().collect(),
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn update_matches_a(&mut self, cx: &mut WindowContext) {
@@ -454,10 +416,10 @@ impl PickerDelegate for TabSwitcherDelegate {
         cx: &mut ViewContext<Picker<Self>>,
     ) -> Task<()> {
         if raw_query.is_empty() {
-          self.update_matches_a(cx);
-          Task::ready(())
+            self.update_matches_a(cx);
+            Task::ready(())
         } else {
-          self.update_matches_by_query(raw_query, cx)
+            self.update_matches_by_query(raw_query, cx)
         }
     }
 
